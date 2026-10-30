@@ -1,0 +1,829 @@
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const { WebSocketServer } = require('ws');
+const { MINISTRIES, BUILDINGS, TECHS, POLICIES, EVENTS, ACHIEVEMENTS } = require('./content');
+
+const PORT = process.env.PORT || 3000;
+const TICK_MS = 2000;
+const ELECTION_EVERY = 90;   // тиков (~3 минуты)
+const ACHIEVEMENT_EVERY = 5; // тиков
+const MAX_POLICIES = 4;
+const NPC_NAMES = ['Северия', 'Тарганна', 'Ковердия', 'Лантания'];
+
+const rooms = new Map();
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const uid = () => Math.random().toString(36).slice(2, 10);
+const pairKey = (a, b) => [a, b].sort().join('|');
+const cut = (s, n) => String(s ?? '').trim().slice(0, n);
+const has = (obj, k) => typeof k === 'string' && Object.hasOwn(obj, k);
+const send = (ws, obj) => ws.readyState === 1 && ws.send(JSON.stringify(obj));
+const total = (c) => Object.values(c.buildings).reduce((a, b) => a + b, 0);
+
+// Модификаторы от технологий и политик
+const techMul = (c, k) => [...c.techs].reduce((m, t) => m * (TECHS[t].mul?.[k] ?? 1), 1);
+const techAdd = (c, k) => [...c.techs].reduce((s, t) => s + (TECHS[t].add?.[k] ?? 0), 0);
+const polSum = (c, k) => [...c.policies].reduce((s, p) => s + (POLICIES[p][k] ?? 0), 0);
+const getCost = (c, k) => Math.round(BUILDINGS[k].cost * techMul(c, 'buildCost'));
+const score = (c) => Math.round(
+  c.money / 100 + c.population + power(c) + c.techs.size * 20
+  + total(c) * 2 + c.science / 10 + c.culture / 5
+);
+
+function newCountry(name, rulerId) {
+  return {
+    id: uid(), name, rulerId, isNpc: false,
+    money: 1500, food: 300, army: 20, bombs: 0,
+    population: 60, happy: 60, tax: 10,
+    science: 0, culture: 0, iron: 0, oil: 0,
+    spies: 0, security: 0, pollution: 0,
+    buildings: {}, ministers: {},
+    techs: new Set(), policies: new Set(),
+    wins: 0, peaceCount: 0, bombsUsed: 0,
+  };
+}
+
+function power(c) {
+  return c.army * (c.ministers.defense ? 1.15 : 1) * techMul(c, 'army');
+}
+
+function addNews(room, text) {
+  room.news.unshift({ t: Date.now(), text });
+  room.news.length = Math.min(room.news.length, 100);
+}
+
+function spendBuild(c, k) {
+  c.money -= getCost(c, k);
+  c.buildings[k] = (c.buildings[k] || 0) + 1;
+}
+
+function destroyBuilding(c) {
+  const keys = Object.keys(c.buildings);
+  if (!keys.length) return null;
+  const k = pick(keys);
+  if (--c.buildings[k] <= 0) delete c.buildings[k];
+  return BUILDINGS[k].name;
+}
+
+function createRoom(code) {
+  const room = {
+    code, ticks: 0,
+    players: new Map(), countries: new Map(), parties: new Map(),
+    wars: new Set(), alliances: new Set(), trades: new Set(), sanctions: new Set(),
+    proposals: [], news: [], chat: [],
+  };
+  for (const name of NPC_NAMES) {
+    const c = newCountry(name, 'npc');
+    c.isNpc = true;
+    c.army = Math.round(rnd(30, 80));
+    c.money = Math.round(rnd(1000, 3000));
+    c.buildings = { house: 5, farm: 2, shop: 1 };
+    room.countries.set(c.id, c);
+  }
+  rooms.set(code, room);
+  addNews(room, `В мире ${NPC_NAMES.length} ИИ-государств. Основывайте свои!`);
+  return room;
+}
+
+function stepDown(room, p, c) {
+  c.rulerId = null;
+  p.role = 'citizen';
+  c.ministers = {};
+  addNews(room, `${p.name} сложил(а) полномочия в «${c.name}»`);
+}
+
+function resolveProposal(room, prop, yes) {
+  const a = room.countries.get(prop.from);
+  const b = room.countries.get(prop.to);
+  if (!a || !b || !yes) return;
+  const key = pairKey(a.id, b.id);
+  if (prop.kind === 'peace') {
+    room.wars.delete(key);
+    a.peaceCount++;
+    b.peaceCount++;
+    addNews(room, `🕊 «${a.name}» и «${b.name}» подписали мирный договор`);
+  } else if (prop.kind === 'alliance') {
+    room.alliances.add(key);
+    addNews(room, `🤝 «${a.name}» и «${b.name}» заключили союз`);
+  } else if (prop.kind === 'trade') {
+    room.trades.add(key);
+    addNews(room, `📦 «${a.name}» и «${b.name}» подписали торговое соглашение`);
+  }
+}
+
+function decideNpc(room, prop) {
+  const from = room.countries.get(prop.from);
+  const to = room.countries.get(prop.to);
+  let yes;
+  if (prop.kind === 'peace') yes = power(to) < power(from) * 1.1 || Math.random() < 0.1;
+  else if (prop.kind === 'alliance') yes = Math.random() < 0.4;
+  else yes = Math.random() < 0.7;
+  resolveProposal(room, prop, yes);
+}
+
+function stepEconomy(room, c) {
+  const sums = { money: 0, food: 0, pop: 0, happy: 0, army: 0, science: 0, culture: 0, iron: 0, oil: 0, env: 0, security: 0 };
+  for (const [k, n] of Object.entries(c.buildings)) {
+    const b = BUILDINGS[k];
+    for (const key of Object.keys(sums)) sums[key] += (b[key] || 0) * n;
+    if (b.bombs && Math.random() < 0.15 * n) c.bombs += b.bombs;
+  }
+
+  const sanctioned = [...room.sanctions].filter((k) => k.endsWith('>' + c.id)).length;
+  const moneyMul = techMul(c, 'money') * (1 + polSum(c, 'money')) * (c.ministers.economy ? 1.15 : 1);
+  const foodMul = techMul(c, 'food') * (1 + polSum(c, 'food'));
+  const sciMul = techMul(c, 'science') * (1 + polSum(c, 'science'));
+
+  c.money = Math.round(
+    c.money + sums.money * moneyMul + c.population * c.tax * 0.02 * moneyMul
+    - c.army * 0.2 - sanctioned * 8
+  );
+  c.food = Math.max(0, c.food + sums.food * foodMul - c.population * 0.15);
+  c.army = Math.max(0, c.army + sums.army * 0.1 * techMul(c, 'army') + polSum(c, 'army'));
+  c.science += sums.science * sciMul + c.population * 0.01 * sciMul;
+  c.culture += sums.culture + polSum(c, 'culture');
+  c.iron += sums.iron;
+  c.oil += sums.oil;
+  c.pollution = sums.env + polSum(c, 'env') - (c.ministers.environment ? 2 : 0);
+  c.security = sums.security + polSum(c, 'security') + (c.ministers.interior ? 2 : 0);
+
+  const warCount = [...room.wars].filter((k) => k.split('|').includes(c.id)).length;
+  const target = clamp(
+    40 + sums.happy + polSum(c, 'happy') + techAdd(c, 'happy')
+      + (c.ministers.health ? 3 : 0) + (c.ministers.culture ? 2 : 0)
+      - (c.tax - 10) * 1.5 + (c.food > 0 ? 5 : -20)
+      - warCount * 3 - sanctioned - Math.max(0, c.pollution) * 0.5
+      + (c.money < 0 ? -10 : 0),
+    0, 100
+  );
+  c.happy += (target - c.happy) * 0.2;
+
+  if (c.food <= 0 && c.population > 5) c.population -= 1;
+  else if (c.happy > 50 && c.population < 30 + sums.pop) c.population += 1;
+}
+
+function stepWars(room) {
+  for (const key of [...room.wars]) {
+    const [a, b] = key.split('|');
+    const A = room.countries.get(a);
+    const B = room.countries.get(b);
+    if (!A || !B) { room.wars.delete(key); continue; }
+
+    const pa = power(A), pb = power(B);
+    A.army = Math.max(0, A.army - pb * rnd(0.02, 0.05));
+    B.army = Math.max(0, B.army - pa * rnd(0.02, 0.05));
+    A.happy = clamp(A.happy - 1, 0, 100);
+    B.happy = clamp(B.happy - 1, 0, 100);
+
+    for (const [loser, winner] of [[A, B], [B, A]]) {
+      if (power(loser) < power(winner) * 0.5 && Math.random() < 0.2) {
+        const lost = destroyBuilding(loser);
+        const loot = Math.round(loser.money * 0.05);
+        loser.money -= loot;
+        winner.money += loot;
+        if (lost) addNews(room, `«${winner.name}» захватила часть «${loser.name}»: разрушено «${lost}», трофеи ${loot}`);
+      }
+    }
+
+    if (A.army < 3 || B.army < 3) {
+      room.wars.delete(key);
+      const winner = A.army < 3 ? B : A;
+      winner.wins++;
+      addNews(room, `Война «${A.name}» и «${B.name}» окончена. Победитель: «${winner.name}»`);
+    }
+  }
+}
+
+function npcThink(room, c) {
+  if (Math.random() > 0.1 || !c.rulerId) return;
+
+  // ИИ иногда изучает технологии
+  const next = Object.keys(TECHS).find((t) => !c.techs.has(t)
+    && (TECHS[t].req || []).every((r) => c.techs.has(r)) && c.science >= TECHS[t].cost);
+  if (next && Math.random() < 0.5) {
+    c.science -= TECHS[next].cost;
+    c.techs.add(next);
+    addNews(room, `🔬 ИИ-держава «${c.name}» изучила: ${TECHS[next].name}`);
+    return;
+  }
+
+  const r = Math.random();
+  const affordable = Object.keys(BUILDINGS).filter((k) => getCost(c, k) <= c.money * 0.4
+    && (!BUILDINGS[k].req || c.techs.has(BUILDINGS[k].req)));
+  if (r < 0.5 && affordable.length) return spendBuild(c, pick(affordable));
+
+  const humans = [...room.countries.values()].filter((x) => !x.isNpc && x.rulerId);
+  if (!humans.length) return;
+  const t = pick(humans);
+  const key = pairKey(c.id, t.id);
+
+  if (r < 0.7 && !room.wars.has(key) && !room.alliances.has(key) && power(c) > power(t) * 1.3) {
+    room.wars.add(key);
+    addNews(room, `⚔️ ИИ-держава «${c.name}» объявила войну «${t.name}»`);
+  } else if (room.wars.has(key) && power(c) < power(t) * 0.7 && Math.random() < 0.3
+    && !room.proposals.some((x) => x.from === c.id && x.to === t.id)) {
+    room.proposals.push({ id: uid(), kind: 'peace', from: c.id, to: t.id });
+  }
+}
+
+function maybeEvent(room, c) {
+  const ev = pick(EVENTS);
+  const negative = (ev.money || 0) < 0 || (ev.happy || 0) < 0 || ev.destroy || ev.popMul < 1;
+  if (negative && Math.random() < clamp(c.security / 10, 0, 0.8)) return;
+
+  c.money += ev.money || 0;
+  c.food = Math.max(0, c.food + (ev.food || 0));
+  c.happy = clamp(c.happy + (ev.happy || 0), 0, 100);
+  c.science += ev.science || 0;
+  c.culture += ev.culture || 0;
+  if (ev.popMul) c.population = Math.max(1, c.population * ev.popMul);
+  if (ev.armyMul) c.army *= ev.armyMul;
+  const lost = [];
+  for (let i = 0; i < (ev.destroy || 0); i++) {
+    const d = destroyBuilding(c);
+    if (d) lost.push(d);
+  }
+  addNews(room, `📰 «${c.name}»: ${ev.name}. ${ev.text}${lost.length ? ` Разрушено: ${lost.join(', ')}.` : ''}`);
+}
+
+function holdElections(room) {
+  for (const c of room.countries.values()) {
+    if (c.isNpc) continue;
+    const cur = c.rulerId ? room.players.get(c.rulerId) : null;
+    if (cur && (c.happy >= 40 || Math.random() < 0.5)) {
+      addNews(room, `🗳 Выборы в «${c.name}»: ${cur.name} сохраняет власть`);
+      continue;
+    }
+    const cands = [...room.players.values()]
+      .filter((x) => x.countryId === c.id && x.role === 'citizen' && x.influence >= 10)
+      .sort((a, b) => b.influence - a.influence);
+    if (!cands.length) continue;
+    const best = cands[0];
+    if (cur) cur.role = 'citizen';
+    best.role = 'ruler';
+    c.rulerId = best.id;
+    c.ministers = {};
+    addNews(room, `🗳 Выборы в «${c.name}»: новым правителем стал(а) ${best.name}`);
+  }
+}
+
+function checkAchievements(room) {
+  for (const p of room.players.values()) {
+    const c = room.countries.get(p.countryId);
+    if (!c) continue;
+    for (const a of ACHIEVEMENTS) {
+      if (p.achievements.has(a.id) || !a.check(c, p, room)) continue;
+      p.achievements.add(a.id);
+      addNews(room, `🏆 ${p.name} получил(а) достижение «${a.name}»`);
+    }
+  }
+}
+
+function tick(room) {
+  room.ticks++;
+
+  for (const key of [...room.trades]) {
+    const [a, b] = key.split('|');
+    const A = room.countries.get(a), B = room.countries.get(b);
+    if (!A || !B) { room.trades.delete(key); continue; }
+    if (room.wars.has(key) || room.sanctions.has(`${a}>${b}`) || room.sanctions.has(`${b}>${a}`)) continue;
+    A.money += 20;
+    B.money += 20;
+  }
+
+  for (const c of room.countries.values()) {
+    if (c.isNpc) npcThink(room, c);
+    if (Math.random() < 0.02) maybeEvent(room, c);
+    stepEconomy(room, c);
+  }
+
+  stepWars(room);
+  if (room.ticks % ELECTION_EVERY === 0) holdElections(room);
+
+  for (const p of room.players.values()) {
+    if (p.role === 'citizen') p.influence = clamp(p.influence + 0.1, 0, 100);
+  }
+  if (room.ticks % ACHIEVEMENT_EVERY === 0) checkAchievements(room);
+
+  sendStateAll(room);
+}
+
+function leaveParty(room, p) {
+  const party = room.parties.get(p.partyId);
+  if (!party) return;
+  party.members.delete(p.id);
+  p.partyId = null;
+  if (!party.members.size) room.parties.delete(party.id);
+  else if (party.leaderId === p.id) party.leaderId = [...party.members][0];
+}
+
+function handleAct(room, p, action, d) {
+  const c = room.countries.get(p.countryId);
+  if (!c) return 'Страна не найдена';
+  const ruler = p.role === 'ruler';
+  const needRuler = 'Это может делать только глава государства';
+  const target = () => room.countries.get(d.target);
+
+  switch (action) {
+    // ---- Управление государством ----
+    case 'build': {
+      if (!ruler) return needRuler;
+      if (!has(BUILDINGS, d.b)) return 'Нет такой постройки';
+      const b = BUILDINGS[d.b];
+      if (b.req && !c.techs.has(b.req)) return `Нужна технология: ${TECHS[b.req].name}`;
+      if (c.money < getCost(c, d.b)) return 'Не хватает денег';
+      spendBuild(c, d.b);
+      return null;
+    }
+    case 'tax': {
+      if (!ruler) return needRuler;
+      c.tax = clamp(Math.round(+d.v || 0), 0, 50);
+      return null;
+    }
+    case 'recruit': {
+      if (!ruler) return needRuler;
+      const n = clamp(Math.round(+d.v || 0), 1, 50);
+      if (c.money < n * 10) return 'Не хватает денег';
+      c.money -= n * 10;
+      c.army += n;
+      return null;
+    }
+    case 'appoint': {
+      if (!ruler) return needRuler;
+      if (!has(MINISTRIES, d.role)) return 'Нет такого министерства';
+      const name = cut(d.v, 30);
+      if (!name) {
+        delete c.ministers[d.role];
+      } else {
+        c.ministers[d.role] = name;
+        addNews(room, `«${c.name}»: ${name} назначен(а) министром — ${MINISTRIES[d.role]}`);
+      }
+      return null;
+    }
+    case 'abdicate': {
+      if (!ruler) return needRuler;
+      stepDown(room, p, c);
+      return null;
+    }
+
+    // ---- Наука и политика ----
+    case 'research': {
+      if (!ruler) return needRuler;
+      if (!has(TECHS, d.v)) return 'Нет такой технологии';
+      const t = TECHS[d.v];
+      if (c.techs.has(d.v)) return 'Уже изучено';
+      if ((t.req || []).some((r) => !c.techs.has(r))) return 'Нужны предварительные технологии';
+      if (c.science < t.cost) return 'Не хватает очков науки';
+      c.science -= t.cost;
+      c.techs.add(d.v);
+      addNews(room, `🔬 «${c.name}» изучила: ${t.name}`);
+      return null;
+    }
+    case 'policy': {
+      if (!ruler) return needRuler;
+      if (!has(POLICIES, d.v)) return 'Нет такой политики';
+      if (c.policies.has(d.v)) {
+        c.policies.delete(d.v);
+        addNews(room, `«${c.name}» отменила политику: ${POLICIES[d.v].name}`);
+        return null;
+      }
+      const conflict = (POLICIES[d.v].conflicts || []).find((x) => c.policies.has(x));
+      if (conflict) return `Несовместимо с: ${POLICIES[conflict].name}`;
+      if (c.policies.size >= MAX_POLICIES) return `Максимум ${MAX_POLICIES} политик одновременно`;
+      c.policies.add(d.v);
+      addNews(room, `📜 «${c.name}» ввела политику: ${POLICIES[d.v].name}`);
+      return null;
+    }
+
+    // ---- Дипломатия и войны ----
+    case 'declareWar': {
+      if (!ruler) return needRuler;
+      const t = target();
+      if (!t || t === c) return 'Нет такой страны';
+      const key = pairKey(c.id, t.id);
+      if (room.alliances.has(key)) return 'Нельзя воевать с союзником';
+      if (room.wars.has(key)) return 'Вы уже воюете';
+      room.wars.add(key);
+      addNews(room, `⚔️ «${c.name}» объявила войну «${t.name}»`);
+      return null;
+    }
+    case 'bomb': {
+      if (!ruler) return needRuler;
+      const t = target();
+      if (!t) return 'Нет такой страны';
+      if (!room.wars.has(pairKey(c.id, t.id))) return 'Бомбить можно только страну, с которой вы воюете';
+      if (c.bombs < 1) return 'Нет бомб: постройте арсенал';
+      c.bombs--;
+      c.bombsUsed++;
+      const killed = Math.round(t.population * rnd(0.05, 0.15));
+      t.population = Math.max(1, t.population - killed);
+      t.happy = clamp(t.happy - 10, 0, 100);
+      const lost = [destroyBuilding(t), destroyBuilding(t)].filter(Boolean);
+      c.happy = clamp(c.happy - 2, 0, 100);
+      addNews(room, `💣 «${c.name}» сбросила бомбу на «${t.name}»: погибло ${killed} чел., разрушено: ${lost.join(', ') || 'ничего'}`);
+      return null;
+    }
+    case 'annex': {
+      if (!ruler) return needRuler;
+      const t = target();
+      if (!t || t === c) return 'Нет такой страны';
+      const key = pairKey(c.id, t.id);
+      if (!room.wars.has(key)) return 'Аннексия возможна только во время войны';
+      if (power(c) < power(t) * 3 || t.army >= 10) {
+        return 'Аннексия возможна, если ваша сила втрое больше, а армия противника меньше 10';
+      }
+      const moved = Math.round(t.population * 0.2);
+      t.population = Math.max(1, t.population - moved);
+      c.population += moved;
+      for (const [k, n] of Object.entries(t.buildings)) {
+        const half = Math.floor(n / 2);
+        if (!half) continue;
+        t.buildings[k] -= half;
+        c.buildings[k] = (c.buildings[k] || 0) + half;
+      }
+      room.wars.delete(key);
+      c.wins++;
+      addNews(room, `🏴 «${c.name}» аннексировала часть «${t.name}»`);
+      return null;
+    }
+    case 'sanction': {
+      if (!ruler) return needRuler;
+      const t = target();
+      if (!t || t === c) return 'Нет такой страны';
+      if (room.alliances.has(pairKey(c.id, t.id))) return 'Нельзя санкционировать союзника';
+      room.sanctions.add(`${c.id}>${t.id}`);
+      addNews(room, `🚫 «${c.name}» ввела санкции против «${t.name}»`);
+      return null;
+    }
+    case 'liftSanction': {
+      if (!ruler) return needRuler;
+      const t = target();
+      if (!t) return 'Нет такой страны';
+      room.sanctions.delete(`${c.id}>${t.id}`);
+      addNews(room, `«${c.name}» сняла санкции с «${t.name}»`);
+      return null;
+    }
+    case 'proposal': {
+      if (!ruler) return needRuler;
+      const t = target();
+      if (!t || t === c) return 'Нет такой страны';
+      if (!['peace', 'alliance', 'trade'].includes(d.kind)) return 'Неизвестный тип предложения';
+      const key = pairKey(c.id, t.id);
+      if (d.kind === 'peace' && !room.wars.has(key)) return 'Вы не воюете с этой страной';
+      if (d.kind === 'alliance' && (room.wars.has(key) || room.alliances.has(key))) return 'Союз невозможен (война или уже союзники)';
+      if (d.kind === 'trade' && (room.wars.has(key) || room.sanctions.has(`${c.id}>${t.id}`) || room.sanctions.has(`${t.id}>${c.id}`))) {
+        return 'Торговля невозможна (война или санкции)';
+      }
+      const prop = { id: uid(), kind: d.kind, from: c.id, to: t.id };
+      if (t.isNpc) decideNpc(room, prop);
+      else room.proposals.push(prop);
+      return null;
+    }
+    case 'respond': {
+      if (!ruler) return needRuler;
+      const i = room.proposals.findIndex((x) => x.id === d.id);
+      if (i < 0) return 'Предложение уже неактуально';
+      const prop = room.proposals[i];
+      if (prop.to !== c.id) return 'Это не ваше предложение';
+      room.proposals.splice(i, 1);
+      resolveProposal(room, prop, d.yes === '1');
+      return null;
+    }
+    case 'spyRecruit': {
+      if (!ruler) return needRuler;
+      const n = clamp(Math.round(+d.v || 0), 1, 20);
+      if (c.money < n * 50) return 'Не хватает денег';
+      c.money -= n * 50;
+      c.spies += n;
+      return null;
+    }
+    case 'spyOp': {
+      if (!ruler) return needRuler;
+      const t = target();
+      if (!t || t === c) return 'Нет такой страны';
+      if (!['steal', 'sabotage', 'propaganda'].includes(d.op)) return 'Неизвестная операция';
+      if (c.spies < 1) return 'Нет шпионов';
+      if (c.money < 20) return 'Не хватает денег на операцию';
+      c.money -= 20;
+      c.spies--;
+      const chance = clamp(0.45 * techMul(c, 'spy'), 0.1, 0.9);
+      if (Math.random() > chance) {
+        addNews(room, `🕵️ Шпион из «${c.name}» провалился в «${t.name}» и арестован`);
+        return null;
+      }
+      p.spyWins++;
+      if (d.op === 'steal') {
+        const loot = Math.round(t.money * 0.05);
+        t.money -= loot;
+        c.money += loot;
+        addNews(room, `💰 В «${t.name}» пропало ${loot} денег. Подозревают «${c.name}»`);
+      } else if (d.op === 'sabotage') {
+        const lost = destroyBuilding(t);
+        addNews(room, `🧨 Диверсия в «${t.name}»${lost ? `: разрушено «${lost}»` : ''}`);
+      } else {
+        t.happy = clamp(t.happy - 5, 0, 100);
+        addNews(room, `📢 В «${t.name}» распространяется пропаганда из «${c.name}»`);
+      }
+      return null;
+    }
+
+    // ---- Партии ----
+    case 'createParty': {
+      if (p.partyId) return 'Вы уже в партии';
+      const name = cut(d.v, 30);
+      if (!name) return 'Введите название партии';
+      const party = { id: uid(), name, leaderId: p.id, members: new Set([p.id]) };
+      room.parties.set(party.id, party);
+      p.partyId = party.id;
+      p.partyCreated = true;
+      addNews(room, `🎉 Создана партия «${name}»`);
+      return null;
+    }
+    case 'joinParty': {
+      if (p.partyId) return 'Сначала выйдите из текущей партии';
+      const party = room.parties.get(d.target);
+      if (!party) return 'Партия не найдена';
+      party.members.add(p.id);
+      p.partyId = party.id;
+      return null;
+    }
+    case 'leaveParty': {
+      leaveParty(room, p);
+      return null;
+    }
+
+    // ---- Жизнь гражданина ----
+    case 'work': {
+      if (ruler) return 'Главе государства работа не нужна';
+      p.savings += Math.round(25 + p.skill * 10 + rnd(0, 10));
+      return null;
+    }
+    case 'study': {
+      if (ruler) return 'Вы у власти';
+      if (p.skill >= 5) return 'Максимальный навык';
+      if (p.savings < 50) return 'Не хватает сбережений';
+      p.savings -= 50;
+      p.skill++;
+      return null;
+    }
+    case 'buyHouse': {
+      if (p.house) return 'Дом уже куплен';
+      if (p.savings < 300) return 'Не хватает сбережений (нужно 300)';
+      p.savings -= 300;
+      p.house = true;
+      return null;
+    }
+    case 'campaign': {
+      if (ruler) return 'Вы уже у власти';
+      if (p.savings < 20) return 'Не хватает сбережений';
+      p.savings -= 20;
+      p.influence = clamp(p.influence + 3, 0, 100);
+      return null;
+    }
+    case 'protest': {
+      if (ruler) return 'Вы у власти, протестовать не с кем';
+      p.influence = clamp(p.influence + 2, 0, 100);
+      c.happy = clamp(c.happy - 2, 0, 100);
+      if (Math.random() < 0.3) {
+        p.savings = Math.max(0, p.savings - 50);
+        addNews(room, `${p.name} задержан(а) на протесте в «${c.name}»`);
+      } else {
+        addNews(room, `${p.name} вышел(ла) на протест в «${c.name}»`);
+      }
+      return null;
+    }
+    case 'rebel': {
+      if (ruler) return 'Вы у власти';
+      if (p.influence < 30) return 'Нужно влияние 30+';
+      if (c.happy >= 35) return 'Народ пока не готов к восстанию (настроение ниже 35%)';
+      if (Math.random() < 0.3) {
+        const rebel = newCountry(`${c.name} (повстанцы)`, p.id);
+        rebel.population = Math.max(5, Math.round(c.population * 0.4));
+        c.population -= rebel.population;
+        for (const [k, n] of Object.entries(c.buildings)) {
+          const half = Math.floor(n / 2);
+          if (!half) continue;
+          c.buildings[k] -= half;
+          rebel.buildings[k] = half;
+        }
+        rebel.money = 300;
+        rebel.happy = 50;
+        room.countries.set(rebel.id, rebel);
+        p.countryId = rebel.id;
+        p.role = 'ruler';
+        p.rebelled = true;
+        addNews(room, `🔥 Восстание в «${c.name}»! ${p.name} провозгласил(а) «${rebel.name}»`);
+        return null;
+      }
+      p.savings = Math.max(0, p.savings - 50);
+      p.influence = clamp(p.influence - 5, 0, 100);
+      c.happy = clamp(c.happy - 2, 0, 100);
+      addNews(room, `Восстание в «${c.name}» подавлено, ${p.name} в тюрьме`);
+      return 'Восстание подавлено';
+    }
+    case 'moveTo': {
+      const t = room.countries.get(d.target || d.v);
+      if (!t || t === c) return 'Нет такой страны';
+      if (ruler) stepDown(room, p, c);
+      p.countryId = t.id;
+      p.role = 'citizen';
+      addNews(room, `${p.name} переехал(а) в «${t.name}»`);
+      return null;
+    }
+    case 'claim': {
+      if (ruler) return 'Вы уже у власти';
+      const blocked = c.ministers.interior ? 0.1 : 0;
+      const partyBonus = p.partyId ? 0.05 : 0;
+      const chance = c.rulerId
+        ? clamp(0.08 + p.influence / 120 + (100 - c.happy) / 250 + partyBonus - blocked, 0.05, 0.7)
+        : clamp(0.4 + p.influence / 150, 0.4, 0.95);
+      if (Math.random() < chance) {
+        if (c.rulerId && !c.isNpc) {
+          const old = room.players.get(c.rulerId);
+          if (old) old.role = 'citizen';
+        }
+        c.rulerId = p.id;
+        c.isNpc = false;
+        p.role = 'ruler';
+        p.comebacks++;
+        addNews(room, `👑 ${p.name} вернулся(ась) к власти в «${c.name}»`);
+        return null;
+      }
+      p.savings = Math.max(0, p.savings - 40);
+      p.influence = clamp(p.influence - 5, 0, 100);
+      addNews(room, `${p.name} пытался(ась) вернуть власть в «${c.name}» — неудачно`);
+      return 'Попытка не удалась: сбережения и влияние уменьшились';
+    }
+    default:
+      return 'Неизвестное действие';
+  }
+}
+
+function stateFor(room, p) {
+  const countries = [...room.countries.values()].map((c) => ({
+    id: c.id,
+    name: c.name,
+    isNpc: !!c.isNpc,
+    rulerName: c.rulerId === 'npc' ? 'ИИ' : (room.players.get(c.rulerId)?.name || null),
+    money: Math.round(c.money),
+    food: Math.round(c.food),
+    army: Math.round(c.army),
+    bombs: c.bombs,
+    population: Math.round(c.population),
+    happy: Math.round(c.happy),
+    tax: c.tax,
+    science: Math.round(c.science),
+    culture: Math.round(c.culture),
+    spies: c.spies,
+    security: Math.round(c.security),
+    pollution: Math.round(c.pollution),
+    wins: c.wins,
+    buildings: c.buildings,
+    ministers: c.ministers,
+    techs: [...c.techs],
+    policies: [...c.policies],
+    power: Math.round(power(c)),
+    score: score(c),
+    buildingCount: total(c),
+    citizens: [...room.players.values()]
+      .filter((x) => x.countryId === c.id && x.role === 'citizen')
+      .map((x) => x.name),
+  }));
+  const nameOf = (id) => room.countries.get(id)?.name || '?';
+  return {
+    room: room.code,
+    ticks: room.ticks,
+    electionIn: ELECTION_EVERY - (room.ticks % ELECTION_EVERY),
+    you: {
+      id: p.id, name: p.name, role: p.role, countryId: p.countryId,
+      savings: Math.round(p.savings), influence: Math.round(p.influence),
+      skill: p.skill, house: p.house, partyId: p.partyId,
+      comebacks: p.comebacks, spyWins: p.spyWins,
+      achievements: [...p.achievements],
+    },
+    countries,
+    wars: [...room.wars],
+    alliances: [...room.alliances],
+    trades: [...room.trades],
+    sanctions: [...room.sanctions],
+    parties: [...room.parties.values()].map((x) => ({
+      id: x.id,
+      name: x.name,
+      leader: room.players.get(x.leaderId)?.name || '—',
+      members: [...x.members].map((id) => room.players.get(id)?.name).filter(Boolean),
+    })),
+    proposals: room.proposals
+      .filter((x) => x.to === p.countryId || x.from === p.countryId)
+      .map((x) => ({ ...x, fromName: nameOf(x.from), toName: nameOf(x.to) })),
+    news: room.news.slice(0, 50),
+    chat: room.chat.slice(-50),
+    defs: {
+      buildings: BUILDINGS,
+      techs: TECHS,
+      policies: POLICIES,
+      ministries: MINISTRIES,
+      achievements: ACHIEVEMENTS.map(({ id, name, desc }) => ({ id, name, desc })),
+    },
+  };
+}
+
+function sendStateAll(room) {
+  for (const p of room.players.values()) {
+    send(p.ws, { t: 'state', state: stateFor(room, p) });
+  }
+}
+
+function join(ws, m) {
+  let room;
+  if (m.room) {
+    room = rooms.get(String(m.room).toUpperCase());
+    if (!room) return send(ws, { t: 'error', msg: 'Комната с таким кодом не найдена' });
+  } else {
+    room = createRoom(Math.random().toString(36).slice(2, 8).toUpperCase());
+  }
+  const p = {
+    id: uid(), name: cut(m.name, 20) || 'Игрок', ws,
+    role: 'ruler', countryId: null,
+    savings: 200, influence: 5, skill: 0, house: false,
+    partyId: null, partyCreated: false, rebelled: false,
+    comebacks: 0, spyWins: 0, lastAct: 0,
+    achievements: new Set(),
+  };
+  const c = newCountry(cut(m.country, 25) || 'Новая держава', p.id);
+  p.countryId = c.id;
+  room.countries.set(c.id, c);
+  room.players.set(p.id, p);
+  ws.roomCode = room.code;
+  ws.playerId = p.id;
+  addNews(room, `${p.name} основал(а) государство «${c.name}»`);
+  send(ws, { t: 'joined', room: room.code, playerId: p.id });
+  sendStateAll(room);
+}
+
+function leave(ws) {
+  const room = rooms.get(ws.roomCode);
+  if (!room) return;
+  const p = room.players.get(ws.playerId);
+  if (!p) return;
+  leaveParty(room, p);
+  room.players.delete(p.id);
+  const c = room.countries.get(p.countryId);
+  if (c && c.rulerId === p.id) {
+    c.rulerId = 'npc';
+    c.isNpc = true;
+  }
+  if (room.players.size === 0) {
+    rooms.delete(room.code);
+    return;
+  }
+  addNews(room, `${p.name} вышел(ла) из игры${c ? `, «${c.name}» теперь управляется ИИ` : ''}`);
+  sendStateAll(room);
+}
+
+const app = express();
+app.use(express.static(path.join(__dirname, 'public')));
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws) => {
+  ws.on('message', (raw) => {
+    let m;
+    try { m = JSON.parse(raw); } catch { return; }
+
+    if (m.t === 'join') {
+      if (!ws.playerId) join(ws, m);
+      return;
+    }
+
+    const room = rooms.get(ws.roomCode);
+    const p = room?.players.get(ws.playerId);
+    if (!p) return;
+
+    if (m.t === 'chat') {
+      const text = cut(m.text, 200);
+      if (!text) return;
+      room.chat.push({ name: p.name, text, t: Date.now() });
+      if (room.chat.length > 200) room.chat.splice(0, room.chat.length - 200);
+      sendStateAll(room);
+    } else if (m.t === 'act') {
+      if (Date.now() - p.lastAct < 300) return send(ws, { t: 'error', msg: 'Слишком быстро' });
+      p.lastAct = Date.now();
+      const err = handleAct(room, p, m.action, m.data || {});
+      if (err) send(ws, { t: 'error', msg: err });
+      sendStateAll(room);
+    }
+  });
+
+  ws.on('close', () => leave(ws));
+});
+
+setInterval(() => {
+  for (const room of rooms.values()) tick(room);
+}, TICK_MS);
+
+server.listen(PORT, () => {
+  console.log(`Держава запущена: http://localhost:${PORT}`);
+});
